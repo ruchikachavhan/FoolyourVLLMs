@@ -1,5 +1,6 @@
 import transformers
 import torch
+import json
 import argparse
 from collections import defaultdict
 import os
@@ -10,7 +11,7 @@ import random
 import math
 import itertools
 from transformers import AutoTokenizer, AutoModelForCausalLM
-
+from debiasing import simple as debias_fn
 
 choices = ["A", "B", "C", "D"]
 
@@ -182,13 +183,154 @@ def gen_prompt(args, train_df, subject, k=-1, n_reduced=None):
         prompt += format_example(args, train_df, i, n_reduced=n_reduced, include_answer=True)
     return prompt
 
+def debias_pride(args, subject, dev_df, test_df, model, tokenizer, n_reduced=0, permute_pos=None):
+    # load results from jsonl file
+    results = [json.loads(line) for line in open(os.path.join(args.result_path, f'{subject}.jsonl'))]
+    # get only predictions and labels from all results
+    predictions = []
+    labels = []
+    for result in results:
+        predictions.append(result['data']['probs'])
+        labels.append(result['data']['ideal'])
+    results = list(zip(predictions, labels))
+
+    n_iters = 5
+    if args.ratio_prefix_samples == 1.:
+        n_iters = 1
+    num_prefix_samples = int(len(results) * args.ratio_prefix_samples)
+
+    accuracies, cor_original = [], []
+    for iter_idx in range(n_iters):
+        predictions = []
+        labels = []
+        cost = []
+        random.shuffle(results)
+        prefix_samples = results[:num_prefix_samples]
+        postfix_samples = results[num_prefix_samples:]
+
+        all_priors = []
+        all_observed = []
+        for idx, prefix_sample in enumerate(prefix_samples):
+            observed, ideal = prefix_sample
+            observed = np.array(observed)
+            observed, debiased, prior = debias_fn(observed)
+            all_priors.append(prior)
+            all_observed.append(observed)
+            predictions.append(np.argmax(debiased))
+            cost.append(len(observed))
+            labels.append('ABCDE'.index(ideal))
+
+        prior = np.mean(all_priors, axis=0)
+        
+        # store accuracies for each permutation
+        acc_perms = []
+        num_permutations = len(postfix_samples[0][0])
+        for perm_i in range(num_permutations):
+            postfix_predictions, postfix_labels = [], []
+            for postfix_sample in postfix_samples:
+                observed_perms, ideal = postfix_sample            
+                observed = np.array(observed_perms[perm_i])
+                debiased = np.log(observed + 1e-10) - np.log(prior + 1e-10)
+                postfix_predictions.append(np.argmax(debiased))
+                postfix_labels.append('ABCDE'.index(ideal))
+            
+            cor = np.array(labels + postfix_labels) == np.array(predictions + postfix_predictions)
+            # Accuracy of all samples for perm_i
+            acc = np.mean(cor)
+            if  perm_i == 0:
+                cor_original.append(acc)
+            acc_perms.append(acc)
+        
+        # All accuracy over all permutations for iter_idx
+        accuracies += acc_perms
+    
+    original_acc = np.mean(cor_original)
+    print(f"Original order accuracy after debiasing: {original_acc*100:.2f} - {subject}")
+    print(f"Average accuracy over all permutations after debiasing: {np.mean(accuracies)*100:.2f} - {subject}")
+    
+    # Return average accuracy over all iterations and all permutations
+    return accuracies, np.mean(accuracies), original_acc
+
+
+def save_permuted_df_results(args, subject, dev_df, test_df, model, tokenizer, n_reduced=0, permute_pos=None):
+    cors = []
+    num_choices = test_df.shape[1] - 2
+    answers = choices[:num_choices]
+    device = model.device
+    all_preds, all_gt = [], []
+    all_results = []
+    for i in range(test_df.shape[0]):
+        if i > 10 and args.debug:
+            print("Debug mode, breaking early after 10 iterations")
+            break
+        corr = 1
+        if args.reduce_attack:
+            total_perms = len(generate_permutation_indices(num_choices, n_reduced, original_label_idx=ord(test_df.iloc[i, test_df.shape[1]-1]) - ord('A')))
+        elif args.permutation_attack:
+            total_perms = math.factorial(num_choices)
+        right_wrong = []
+        result = {}
+        result['type'] = 'result'
+        result['data'] = {}
+        result['data']['idx'] = i
+        result['data']['prompt'] = ''
+        result['data']['options'] = [test_df.iloc[i, j] for j in range(1, test_df.shape[1]-1)]
+        result['data']['probs'] = []
+        result['data']['ideal'] = test_df.iloc[i, test_df.shape[1]-1]
+        for perm_i in range(total_perms):
+            k = args.ntrain
+            prompt_end, new_label = format_example(args, test_df, i, n_reduced=n_reduced, 
+                                                   include_answer=False, permute_pos=permute_pos, perm_i=perm_i)
+            
+            train_prompt = gen_prompt(args, dev_df, subject, k, n_reduced=n_reduced)
+            prompt = train_prompt + prompt_end
+            label = new_label
+            result['data']['prompt'] += prompt + '\n\n'
+
+            model_inputs = tokenizer(prompt, return_tensors='pt')
+            input_ids = model_inputs.input_ids
+            if not args.load_in_8bit:
+                input_ids = input_ids.to(device)
+            with torch.no_grad():
+                output = model(input_ids)
+            logits = output.logits
+            token_probs = softmax(logits[0, -1, :], dim=-1)
+            
+
+            lprobs = []
+            for ans in answers:
+                ans_id = tokenizer(ans, add_special_tokens=False, return_tensors="pt").input_ids[0].item()
+                lprobs.append(token_probs[ans_id].item())
+            result['data']['probs'].append(lprobs)
+                            
+            pred = {0: "A", 1: "B", 2: "C", 3: "D"}[np.argmax(lprobs)]
+            
+            all_preds.append(pred)
+            all_gt.append(label)
+
+
+            cor = pred == label
+            right_wrong.append(cor)
+        all_results.append(result)
+
+    # save predictions and labels in jsonl file
+    fname = os.path.join(args.result_path, f'{subject}.jsonl')
+    print(f"Saving results to {fname}")
+    with open(fname, 'w') as f:
+        for j, result in enumerate(all_results):
+            f.write(json.dumps(result) + '\n' if j != len(all_results) - 1 else json.dumps(result))
+
 def full_search_eval(args, subject, dev_df, test_df, model, tokenizer, n_reduced=0, permute_pos=None):
     cors = []
     num_choices = test_df.shape[1] - 2
     answers = choices[:num_choices]
     device = model.device
     all_preds, all_gt = [], []
+    all_results = []
     for i in range(test_df.shape[0]):
+        if i > 10 and args.debug:
+            print("Debug mode, breaking early after 10 iterations")
+            break
         corr = 1
         if args.reduce_attack:
             total_perms = len(generate_permutation_indices(num_choices, n_reduced, original_label_idx=ord(test_df.iloc[i, test_df.shape[1]-1]) - ord('A')))
@@ -199,11 +341,10 @@ def full_search_eval(args, subject, dev_df, test_df, model, tokenizer, n_reduced
             k = args.ntrain
             prompt_end, new_label = format_example(args, test_df, i, n_reduced=n_reduced, 
                                                    include_answer=False, permute_pos=permute_pos, perm_i=perm_i)
+            
             train_prompt = gen_prompt(args, dev_df, subject, k, n_reduced=n_reduced)
             prompt = train_prompt + prompt_end
-            
             label = new_label
-
             model_inputs = tokenizer(prompt, return_tensors='pt')
             input_ids = model_inputs.input_ids
             if not args.load_in_8bit:
@@ -212,7 +353,7 @@ def full_search_eval(args, subject, dev_df, test_df, model, tokenizer, n_reduced
                 output = model(input_ids)
             logits = output.logits
             token_probs = softmax(logits[0, -1, :], dim=-1)
-
+            
             lprobs = []
             for ans in answers:
                 ans_id = tokenizer(ans, add_special_tokens=False, return_tensors="pt").input_ids[0].item()
@@ -337,40 +478,63 @@ def main(args):
         model, tokenizer = load_model(args, engine)
         if not args.load_in_8bit:
             model.cuda().half()
+
         for subject in subjects:
+
             dev_df = pd.read_csv(os.path.join(args.data_dir, "dev", subject + "_dev.csv"), header=None)[:args.ntrain]
             test_df = pd.read_csv(os.path.join(args.data_dir, "test", subject + "_test.csv"), header=None)
             if args.use_subset:
                 test_df = test_df[:100]
             
-            if args.permutation_attack or args.reduce_attack:
-                cors, acc = full_search_eval(args, subject, dev_df, test_df, model, tokenizer, n_reduced=args.n_reduced)
-                all_cors.append(cors)
+            if args.debias:
+                os.makedirs("results", exist_ok=True)
+                args.result_path = os.path.join("results", args.data_dir.split("/")[-1])
+                if not os.path.exists(args.result_path):
+                    os.makedirs(args.result_path)
+                # Save predictions in json file
+                if not os.path.exists(os.path.join(args.result_path, f'{subject}.jsonl')):
+                    save_permuted_df_results(args, subject, dev_df, test_df, model, tokenizer, n_reduced=args.n_reduced)
+                # debiasing
+                accuracies, avg_acc_n_iters, original_acc = debias_pride(args, subject, dev_df, test_df, model, tokenizer, n_reduced=args.n_reduced)
+                all_cors.append((avg_acc_n_iters, original_acc))
 
-            elif args.position_permute:
-                tmp_acc = {i: 0 for i in ['A', 'B', 'C', 'D']}
-                for i in ['A', 'B', 'C', 'D']:
-                    new_df = move_answers_to_position(test_df, i)
-                    cors, acc = eval(args, subject, dev_df, new_df, model, tokenizer, n_reduced=args.n_reduced, permute_pos=i)
-                    tmp_acc[i] = acc
-                all_accs.append(tmp_acc)
             else:
-                cors, acc = eval(args, subject, dev_df, test_df, model, tokenizer, n_reduced=args.n_reduced)
-                all_cors.append(cors)
-                all_accs.append(acc)
+                if args.permutation_attack or args.reduce_attack:
+                    cors, acc = full_search_eval(args, subject, dev_df, test_df, model, tokenizer, n_reduced=args.n_reduced)
+                    all_cors.append(cors)
+
+                elif args.position_permute:
+                    tmp_acc = {i: 0 for i in ['A', 'B', 'C', 'D']}
+                    for i in ['A', 'B', 'C', 'D']:
+                        new_df = move_answers_to_position(test_df, i)
+                        cors, acc = eval(args, subject, dev_df, new_df, model, tokenizer, n_reduced=args.n_reduced, permute_pos=i)
+                        tmp_acc[i] = acc
+                    all_accs.append(tmp_acc)
+                else:
+                    cors, acc = eval(args, subject, dev_df, test_df, model, tokenizer, n_reduced=args.n_reduced)
+                    all_cors.append(cors)
+                    all_accs.append(acc)
             
-        if not args.position_permute:
-            weighted_acc = np.mean(np.concatenate(all_cors))
-            print("Average accuracy: {:.2f}".format(weighted_acc*100))
-        elif args.permutation_attack:
-            weighted_acc = np.mean(np.concatenate(all_cors))
-            print("Worst permutation accuracy: {:.2f}".format(weighted_acc*100))
+        if args.debias:
+            # Average accuracy of debiasing predictions over all samples
+                weighted_acc = np.mean([all_cors[i][0] for i in range(len(all_cors))])
+                print("Average accuracy for all permutations post-debiasing: {:.2f}".format(weighted_acc*100))
+                # Average accuracy of original order
+                weighted_acc = np.mean([all_cors[i][1] for i in range(len(all_cors))])
+                print("Average accuracy for original order: {:.2f}".format(weighted_acc*100))
         else:
-            weighted_acc = {i: np.mean([d[i] for d in all_accs]) for i in ['A', 'B', 'C', 'D']}
-            print("Average accuracy")
-            for key, value in weighted_acc.items():
-                print(f"Length {key} - {value * 100:.2f}")
-        
+            if not args.position_permute:
+                weighted_acc = np.mean(np.concatenate(all_cors))
+                print("Average accuracy: {:.2f}".format(weighted_acc*100))
+            elif args.permutation_attack:
+                weighted_acc = np.mean(np.concatenate(all_cors))
+                print("Worst permutation accuracy: {:.2f}".format(weighted_acc*100))
+            else:
+                weighted_acc = {i: np.mean([d[i] for d in all_accs]) for i in ['A', 'B', 'C', 'D']}
+                print("Average accuracy")
+                for key, value in weighted_acc.items():
+                    print(f"Length {key} - {value * 100:.2f}")
+            
         del model
         del tokenizer
         torch.cuda.empty_cache()
@@ -393,6 +557,10 @@ if __name__ == "__main__":
     parser.add_argument("--reduce_attack", "-ra", action='store_true', default=False)
 
     parser.add_argument("--load_in_8bit", "-8bit", action='store_true', default=False)
+    parser.add_argument("--debug", action='store_true', default=False)
+    parser.add_argument("--debias", action='store_true', default=False)
+    parser.add_argument("--ratio_prefix_samples", type=int, default=0.2)
+
 
     args = parser.parse_args()
     main(args)
